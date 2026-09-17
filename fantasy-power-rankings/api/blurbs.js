@@ -1,14 +1,8 @@
 // Vercel serverless function. Keeps your Anthropic API key hidden on the server.
 export default async function handler(req, res) {
-  if (req.method !== "POST") {
-    res.status(405).json({ error: "POST only" });
-    return;
-  }
+  if (req.method !== "POST") { res.status(405).json({ error: "POST only" }); return; }
   const key = process.env.ANTHROPIC_API_KEY;
-  if (!key) {
-    res.status(500).json({ error: "Missing ANTHROPIC_API_KEY environment variable" });
-    return;
-  }
+  if (!key) { res.status(500).json({ error: "Missing ANTHROPIC_API_KEY environment variable" }); return; }
   const model = process.env.BLURB_MODEL || "claude-haiku-4-5";
   const standings = (req.body && req.body.standings) || [];
 
@@ -24,27 +18,12 @@ export default async function handler(req, res) {
   try {
     const r = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-api-key": key,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model,
-        max_tokens: 1200,
-        messages: [{ role: "user", content: prompt }],
-      }),
+      headers: { "content-type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({ model, max_tokens: 1200, messages: [{ role: "user", content: prompt }] }),
     });
     const data = await r.json();
-    if (!r.ok) {
-      res.status(r.status).json({ error: data });
-      return;
-    }
-    const text = (data.content || [])
-      .map((b) => (b.type === "text" ? b.text : ""))
-      .join("")
-      .replace(/```json|```/g, "")
-      .trim();
+    if (!r.ok) { res.status(r.status).json({ error: data }); return; }
+    const text = (data.content || []).map((b) => (b.type === "text" ? b.text : "")).join("").replace(/```json|```/g, "").trim();
     let blurbs = {};
     try { blurbs = JSON.parse(text); } catch (e) { blurbs = {}; }
     res.status(200).json({ blurbs });

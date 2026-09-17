@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
+import { toPng } from "html-to-image";
 
 // ---- Config ----------------------------------------------------------------
 const DEFAULT_LEAGUE_ID = "1398034562679869441";
@@ -8,7 +9,6 @@ const RECENT_WINDOW = 3;
 
 const cache = { players: null };
 
-// Outside the Claude sandbox the direct call works; proxies remain as a safety net.
 const PROXIES = [
   (u) => u,
   (u) => `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(u)}`,
@@ -142,21 +142,15 @@ function templateBlurb(row, team, hot, total) {
 }
 async function generateBlurbs(rows, nameFor, hots) {
   const standings = rows.map((r) => ({
-    rank: r.rank,
-    team: nameFor(r.rosterId).team,
-    manager: nameFor(r.rosterId).manager,
-    powerScore: r.score,
-    record: `${r.wins}-${r.losses}`,
-    pointsFor: Math.round(r.pf),
+    rank: r.rank, team: nameFor(r.rosterId).team, manager: nameFor(r.rosterId).manager,
+    powerScore: r.score, record: `${r.wins}-${r.losses}`, pointsFor: Math.round(r.pf),
     allPlayWinPct: Math.round(r.allPlayPct * 100),
     hotPlayer: hots[r.rosterId]
       ? `${hots[r.rosterId].name || "top starter"}${hots[r.rosterId].pos ? " " + hots[r.rosterId].pos : ""} \u2014 ${hots[r.rosterId].pts} pts, ${hots[r.rosterId].share}% of the team's starter scoring`
       : "none standing out",
   }));
   const res = await fetch("/api/blurbs", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ standings }),
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ standings }),
   });
   if (!res.ok) throw new Error("blurb service error");
   const data = await res.json();
@@ -171,13 +165,18 @@ function Movement({ delta }) {
   const up = delta > 0;
   return <span style={{ color: up ? C.up : C.down, fontSize: 13, fontWeight: 600 }}>{up ? "\u25B2" : "\u25BC"}{Math.abs(delta)}</span>;
 }
+function btn(kind) {
+  const base = { border: "none", borderRadius: 8, padding: "9px 16px", fontWeight: 700, cursor: "pointer" };
+  if (kind === "primary") return { ...base, background: C.gold, color: "#1a1205" };
+  return { ...base, background: C.panelHi, color: C.chalk, border: `1px solid ${C.line}` };
+}
 function TeamCard({ row, name, hot, delta, blurb, isTop, isBottom, i }) {
   return (
-    <div className="reveal" style={{
+    <div style={{
       display: "grid", gridTemplateColumns: "72px 1fr auto", gap: 16, alignItems: "center",
       padding: "18px", borderRadius: 10,
       background: isTop ? `linear-gradient(90deg, rgba(232,178,58,0.14), ${C.panelHi})` : C.panel,
-      border: `1px solid ${isTop ? "rgba(232,178,58,0.35)" : C.line}`, animationDelay: `${i * 55}ms`,
+      border: `1px solid ${isTop ? "rgba(232,178,58,0.35)" : C.line}`,
     }}>
       <div style={{ textAlign: "center", lineHeight: 1 }}>
         <div style={{ fontFamily: displayFont, fontWeight: 700, fontSize: isTop ? 58 : 46, color: isTop ? C.gold : C.chalk }}>{row.rank}</div>
@@ -226,10 +225,12 @@ export default function PowerRankings() {
   const [deltas, setDeltas] = useState({});
   const [blurbs, setBlurbs] = useState({});
   const [blurbState, setBlurbState] = useState("idle");
+  const [discord, setDiscord] = useState("idle"); // idle|posting|done|failed
   const blurbCache = useRef({});
+  const captureRef = useRef(null);
 
   const load = useCallback(async () => {
-    setStatus("loading"); setError(""); setBlurbs({}); setPlayersMissing(false);
+    setStatus("loading"); setError(""); setBlurbs({}); setPlayersMissing(false); setDiscord("idle");
     blurbCache.current = {};
     try {
       setLoadingMsg("Checking the NFL week\u2026");
@@ -277,6 +278,7 @@ export default function PowerRankings() {
 
   useEffect(() => {
     if (status !== "ready" || !week) return;
+    setDiscord("idle");
     const cur = computeRankings(weekly, week, rosterIds);
     setRows(cur);
     const prevWeeks = scoredWeeks(weekly).filter((w) => w < week);
@@ -308,23 +310,52 @@ export default function PowerRankings() {
 
   const nameFor = (id) => names[id] || { team: `Team ${id}`, manager: "" };
   const noData = status === "ready" && (!week || rows.length === 0);
+  const blurbsPending = blurbState === "generating";
+
+  async function snapshot(pixelRatio) {
+    if (!captureRef.current) throw new Error("nothing to capture");
+    if (document.fonts && document.fonts.ready) { try { await document.fonts.ready; } catch (e) {} }
+    return toPng(captureRef.current, { pixelRatio, backgroundColor: C.bg, cacheBust: true });
+  }
+  async function downloadImage() {
+    try {
+      const url = await snapshot(2);
+      const a = document.createElement("a");
+      a.href = url; a.download = `power-rankings-week-${week}.png`; a.click();
+    } catch (e) { alert("Couldn't build the image. Try again in a moment."); }
+  }
+  async function postToDiscord() {
+    setDiscord("posting");
+    try {
+      const url = await snapshot(1.5);
+      const base64 = url.split(",")[1];
+      const res = await fetch("/api/discord", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          image: base64,
+          filename: `power-rankings-week-${week}.png`,
+          content: `**${leagueName} \u2014 Power Rankings \u2014 Week ${week}**`,
+        }),
+      });
+      setDiscord(res.ok ? "done" : "failed");
+    } catch (e) { setDiscord("failed"); }
+  }
 
   return (
     <div style={{ minHeight: "100vh", background: C.bg, color: C.chalk, fontFamily: bodyFont, padding: "28px 18px 60px" }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Oswald:wght@400;500;600;700&display=swap');
-        @keyframes rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
-        .reveal { animation: rise .45s cubic-bezier(.2,.7,.2,1) both; }
-        @media (prefers-reduced-motion: reduce) { .reveal { animation: none; } }
         select, input, button { font-family: inherit; }
       `}</style>
       <div style={{ maxWidth: 860, margin: "0 auto" }}>
-        <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", gap: 16, flexWrap: "wrap", marginBottom: 22 }}>
-          <div>
-            <div style={{ color: C.muted, fontSize: 14 }}>{leagueName || "Fantasy league"}</div>
-            <div style={{ fontFamily: displayFont, fontWeight: 700, fontSize: 44, letterSpacing: 0.5, lineHeight: 1, marginTop: 2 }}>Power Rankings</div>
+        {/* Controls */}
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap", marginBottom: 14 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ color: C.muted, fontSize: 12 }}>League ID</span>
+            <input value={leagueId} onChange={(e) => setLeagueId(e.target.value.trim())} spellCheck={false}
+              style={{ width: 260, background: C.panel, color: C.chalk, border: `1px solid ${C.line}`, borderRadius: 8, padding: "7px 10px", fontSize: 13 }} />
           </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
             {latestWeek > 0 && (
               <label style={{ display: "flex", alignItems: "center", gap: 6, color: C.muted, fontSize: 13 }}>
                 Week
@@ -333,23 +364,33 @@ export default function PowerRankings() {
                 </select>
               </label>
             )}
-            <button onClick={load} disabled={status === "loading"} style={{ background: C.gold, color: "#1a1205", border: "none", borderRadius: 8, padding: "9px 16px", fontWeight: 700, cursor: status === "loading" ? "default" : "pointer", opacity: status === "loading" ? 0.6 : 1 }}>
-              {status === "loading" ? "Loading\u2026" : "Refresh rankings"}
+            <button onClick={load} disabled={status === "loading"} style={{ ...btn("primary"), opacity: status === "loading" ? 0.6 : 1 }}>
+              {status === "loading" ? "Loading\u2026" : "Refresh"}
             </button>
+            {status === "ready" && !noData && (
+              <>
+                <button onClick={downloadImage} disabled={blurbsPending} style={{ ...btn("secondary"), opacity: blurbsPending ? 0.5 : 1 }}>Download image</button>
+                <button onClick={postToDiscord} disabled={blurbsPending || discord === "posting"} style={{ ...btn("secondary"), opacity: (blurbsPending || discord === "posting") ? 0.5 : 1 }}>
+                  {discord === "posting" ? "Posting\u2026" : discord === "done" ? "Posted \u2713" : "Post to Discord"}
+                </button>
+              </>
+            )}
           </div>
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 22, flexWrap: "wrap" }}>
-          <span style={{ color: C.muted, fontSize: 12 }}>League ID</span>
-          <input value={leagueId} onChange={(e) => setLeagueId(e.target.value.trim())} spellCheck={false} style={{ flex: "0 1 320px", background: C.panel, color: C.chalk, border: `1px solid ${C.line}`, borderRadius: 8, padding: "7px 10px", fontSize: 13 }} />
-          {blurbState === "failed" && <span style={{ color: C.muted, fontSize: 12 }}>(AI blurbs off \u2014 showing quick auto-takes)</span>}
-          {playersMissing && <span style={{ color: C.muted, fontSize: 12 }}>(player names unavailable \u2014 hot-hand shows points only)</span>}
-        </div>
+        {status === "ready" && !noData && (
+          <div style={{ minHeight: 18, marginBottom: 10, fontSize: 12, color: discord === "failed" ? C.down : C.muted }}>
+            {blurbsPending && "Blurbs are still generating \u2014 they'll be in the image once they finish."}
+            {!blurbsPending && discord === "failed" && "Couldn't post. Add a DISCORD_WEBHOOK_URL in Vercel (see README), then redeploy."}
+            {!blurbsPending && discord === "done" && "Posted to your Discord channel."}
+          </div>
+        )}
+
         {status === "loading" && <div style={{ color: C.muted, padding: "40px 4px", fontSize: 15 }}>{loadingMsg}</div>}
         {status === "error" && (
           <div style={{ background: C.panel, border: `1px solid ${C.down}`, borderRadius: 10, padding: 20 }}>
             <div style={{ fontFamily: displayFont, fontSize: 20, marginBottom: 6 }}>Couldn't load the league</div>
             <div style={{ color: C.muted, fontSize: 14, lineHeight: 1.5 }}>{error}</div>
-            <button onClick={load} style={{ marginTop: 14, background: C.gold, color: "#1a1205", border: "none", borderRadius: 8, padding: "8px 14px", fontWeight: 700, cursor: "pointer" }}>Try again</button>
+            <button onClick={load} style={{ ...btn("primary"), marginTop: 14 }}>Try again</button>
           </div>
         )}
         {noData && (
@@ -358,17 +399,25 @@ export default function PowerRankings() {
             <div style={{ color: C.muted, fontSize: 14, lineHeight: 1.5 }}>This league has no completed, scored weeks yet. Once Week 1 wraps, refresh and the board will fill in.</div>
           </div>
         )}
+
+        {/* Captured poster */}
         {status === "ready" && !noData && (
-          <>
+          <div ref={captureRef} style={{ background: C.bg, padding: "24px 22px 26px", borderRadius: 12 }}>
+            <div style={{ marginBottom: 16 }}>
+              <div style={{ color: C.muted, fontSize: 13 }}>{leagueName}</div>
+              <div style={{ fontFamily: displayFont, fontWeight: 700, fontSize: 40, letterSpacing: 0.5, lineHeight: 1 }}>
+                Power Rankings <span style={{ color: C.gold, fontSize: 22 }}>{"\u00B7"} Week {week}</span>
+              </div>
+            </div>
             <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
               {rows.map((r, i) => (
                 <TeamCard key={r.rosterId} i={i} row={r} name={nameFor(r.rosterId)} hot={hots[r.rosterId]} delta={deltas[r.rosterId]} blurb={blurbs[r.rosterId]} isTop={r.rank === 1} isBottom={r.rank === rows.length} />
               ))}
             </div>
-            <div style={{ color: C.muted, fontSize: 12, marginTop: 20, lineHeight: 1.6 }}>
-              Power Score blends all-play win% (40%), total points (25%), last-{RECENT_WINDOW}-week scoring (25%), and actual record (10%), each scaled 0\u2013100 across your league. Movement compares to the previous week. Run it Tuesday once scores are final.
+            <div style={{ color: C.muted, fontSize: 11, marginTop: 18, lineHeight: 1.6 }}>
+              Power Score blends all-play win% (40%), total points (25%), last-{RECENT_WINDOW}-week scoring (25%), and actual record (10%), each scaled 0\u2013100 across the league.
             </div>
-          </>
+          </div>
         )}
       </div>
     </div>
