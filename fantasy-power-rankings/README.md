@@ -31,6 +31,20 @@ push the whole board to Discord as an image.
 The board still works. Without ANTHROPIC_API_KEY it uses quick auto-takes
 instead of AI blurbs. Without DISCORD_WEBHOOK_URL, use the Download button.
 
+## Real names
+
+Edit `src/nicknames.js` to map each Sleeper username to a real name
+(e.g. cadehoff -> Cade). Blurbs and cards use these; blank entries fall back
+to the Sleeper name.
+
+## Accuracy
+
+Every AI blurb is fact-checked before it's shown: it may only mention its own
+opponent, can't use numbers that aren't in its data, and can't talk about the
+bench/depth/rest of the roster. Failures get one rewrite; anything still wrong
+is replaced by an accurate auto-written line. Each card also shows the real
+result (W/L, score, opponent) straight from Sleeper.
+
 ## Tweaks
 
 - Ranking weights / recent window: top of `src/PowerRankings.jsx`.

@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import { toPng } from "html-to-image";
+import NICKNAMES from "./nicknames.js";
 
 // ---- Config ----------------------------------------------------------------
 const DEFAULT_LEAGUE_ID = "1398034562679869441";
@@ -141,15 +142,47 @@ function scorers(weekly, rosterId, upto, players) {
   };
 }
 
-function weekResult(weekly, week, rosterId, nameFor) {
+function nickFor(username) {
+  if (!username) return "";
+  const key = Object.keys(NICKNAMES).find((k) => k.toLowerCase() === String(username).toLowerCase());
+  return (key && NICKNAMES[key] && NICKNAMES[key].trim()) || "";
+}
+
+function playerInfo(pid, players) {
+  const p = players && players[pid];
+  return {
+    name: (p && (p.full_name || [p.first_name, p.last_name].filter(Boolean).join(" "))) || null,
+    pos: (p && p.position) || "",
+  };
+}
+
+// This week's actual game, straight from Sleeper: result, both scores, opponent.
+function weekResult(weekly, week, rosterId) {
   const teams = weekly[week] || [];
   const me = teams.find((t) => t.roster_id === rosterId);
   if (!me || me.matchup_id == null) return null;
   const opp = teams.find((t) => t.matchup_id === me.matchup_id && t.roster_id !== rosterId);
   if (!opp) return null;
   const a = me.points || 0, b = opp.points || 0;
-  const res = a > b ? "Won" : a < b ? "Lost" : "Tied";
-  return `${res} ${a.toFixed(1)}-${b.toFixed(1)} vs ${nameFor(opp.roster_id).team}`;
+  return {
+    res: a > b ? "Won" : a < b ? "Lost" : "Tied",
+    me: a, opp: b, oppId: opp.roster_id,
+    margin: Math.round(Math.abs(a - b) * 10) / 10,
+  };
+}
+
+// The team's top starter in THIS week's game only.
+function thisWeekTop(weekly, week, rosterId, players) {
+  const t = (weekly[week] || []).find((x) => x.roster_id === rosterId);
+  if (!t || !t.starters) return null;
+  let best = null;
+  t.starters.forEach((pid, i) => {
+    if (!pid || pid === "0") return;
+    const pts = (t.starters_points && t.starters_points[i]) || 0;
+    if (!best || pts > best.pts) best = { pid, pts };
+  });
+  if (!best || best.pts <= 0) return null;
+  return { ...playerInfo(best.pid, players), pts: Math.round(best.pts * 10) / 10 };
 }
 
 function moveText(d) {
@@ -160,46 +193,61 @@ function moveText(d) {
 }
 
 // ---- Blurbs ----------------------------------------------------------------
-function templateBlurb(row, team, hot, total) {
-  let who = "the lineup", plural = false;
+// Accurate fallback, used for any team whose AI blurb fails the fact check.
+function templateBlurb(row, who, hot, total, wr, oppName) {
+  let stars = "the lineup", plural = false;
   if (hot) {
     const names = [hot.top, ...(hot.balanced ? hot.others : [])].map((p) => p.name).filter(Boolean);
     if (names.length) {
       plural = names.length > 1;
-      who = plural ? `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}` : names[0];
+      stars = plural ? `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}` : names[0];
     }
   }
-  const keep = plural ? "keep" : "keeps", be = plural ? "are" : "is";
-  if (row.rank === 1) return `Top of the mountain, and the all-play numbers back it up. ${who} ${keep} this team rolling.`;
-  if (row.rank === total) return `Somebody has to sit here, and this week it's ${team}. ${who} deserved better.`;
-  if (row.rank <= 3) return `Firmly in contention. ${who} ${keep} this team dangerous.`;
-  if (row.rank >= total - 2) return `Sliding toward the wheel of punishment. Time for ${who} to turn it around.`;
-  return `Stuck in the muddled middle. ${who} ${be} the reason to keep watching.`;
+  const keep = plural ? "keep" : "keeps";
+  const game = wr
+    ? `${wr.res === "Won" ? "Beat" : wr.res === "Lost" ? "Fell to" : "Tied"} ${oppName} ${wr.me.toFixed(1)}-${wr.opp.toFixed(1)} this week. `
+    : "";
+  if (row.rank === 1) return `${game}${who} stays on top, and ${stars} ${keep} this team rolling.`;
+  if (row.rank === total) return `${game}${who} sits in the basement for now. Time for ${stars} to turn it around.`;
+  if (row.rank <= 3) return `${game}${who} is firmly in contention, and ${stars} ${keep} this team dangerous.`;
+  if (row.rank >= total - 2) return `${game}${who} is sliding toward the wheel of punishment. Time for ${stars} to turn it around.`;
+  return `${game}${who} is stuck in the muddled middle, but ${stars} ${keep} things interesting.`;
 }
 
-async function generateBlurbs(rows, nameFor, hots, deltas, weekly, week) {
-  const standings = rows.map((r) => {
-    const hot = hots[r.rosterId];
+async function generateBlurbs(rows, ctx) {
+  const { callName, namesOf, hots, deltas, results, weekTops, week } = ctx;
+  const standings = [], meta = [], playerNames = new Set();
+  rows.forEach((r) => {
+    const id = r.rosterId, hot = hots[id], wr = results[id], tw = weekTops[id];
     const n = hot ? hot.windowWeeks : 0;
-    return {
+    const scorersList = hot ? [hot.top, ...hot.others] : [];
+    scorersList.forEach((p) => p.name && playerNames.add(p.name));
+    if (tw && tw.name) playerNames.add(tw.name);
+    standings.push({
       rank: r.rank,
-      team: nameFor(r.rosterId).team,
-      manager: nameFor(r.rosterId).manager,
+      name: callName(id),
       powerScore: r.score,
-      movement: moveText(deltas[r.rosterId]),
-      thisWeek: weekResult(weekly, week, r.rosterId, nameFor) || "no result",
+      movement: moveText(deltas[id]),
       record: `${r.wins}-${r.losses}`,
       pointsFor: Math.round(r.pf),
       allPlayWinPct: Math.round(r.allPlayPct * 100),
+      thisWeek: wr
+        ? `${wr.res} ${wr.me.toFixed(1)}-${wr.opp.toFixed(1)} against ${callName(wr.oppId)} (margin ${wr.margin.toFixed(1)})`
+        : "no game this week",
+      thisWeekTopScorer: tw ? `${tw.name || "a starter"}${tw.pos ? " (" + tw.pos + ")" : ""}: ${tw.pts} pts this week` : "unknown",
       scoringStyle: hot ? (hot.balanced ? "balanced" : "one standout") : "unknown",
-      keyScorers: hot
-        ? [hot.top, ...hot.others].map((p) =>
-            `${p.name || "a starter"}${p.pos ? " (" + p.pos + ")" : ""}: ${p.pts} pts over the last ${n} week${n === 1 ? "" : "s"}`)
-        : [],
-    };
+      keyScorers: scorersList.map((p) =>
+        `${p.name || "a starter"}${p.pos ? " (" + p.pos + ")" : ""}: ${p.pts} pts over the last ${n} week${n === 1 ? "" : "s"}`),
+    });
+    const numbers = [r.rank, r.score, r.wins, r.losses, r.pf, Math.round(r.allPlayPct * 100), week, n,
+      typeof deltas[id] === "number" ? Math.abs(deltas[id]) : null,
+      wr && wr.me, wr && wr.opp, wr && wr.margin, tw && tw.pts, ...scorersList.map((p) => p.pts)]
+      .filter((x) => typeof x === "number" && isFinite(x));
+    meta.push({ rank: r.rank, ownNames: namesOf(id), oppNames: wr ? namesOf(wr.oppId) : [], numbers });
   });
   const res = await fetch("/api/blurbs", {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ standings }),
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ standings, meta, playerNames: [...playerNames] }),
   });
   if (!res.ok) throw new Error("blurb service error");
   const data = await res.json();
@@ -219,7 +267,7 @@ function btn(kind) {
   if (kind === "primary") return { ...base, background: C.gold, color: "#1a1205" };
   return { ...base, background: C.panelHi, color: C.chalk, border: `1px solid ${C.line}` };
 }
-function TeamCard({ row, name, hot, delta, blurb, isTop, isBottom, i }) {
+function TeamCard({ row, name, hot, delta, blurb, isTop, isBottom, i, result, oppLabel }) {
   return (
     <div style={{
       display: "grid", gridTemplateColumns: "72px 1fr auto", gap: 16, alignItems: "center",
@@ -234,8 +282,16 @@ function TeamCard({ row, name, hot, delta, blurb, isTop, isBottom, i }) {
       <div style={{ minWidth: 0 }}>
         <div style={{ fontFamily: displayFont, fontSize: 24, fontWeight: 600, letterSpacing: 0.3, color: C.chalk }}>{name.team}</div>
         <div style={{ color: C.muted, fontSize: 13, marginTop: 2 }}>
-          {name.manager} &nbsp; {row.wins}-{row.losses} &nbsp; {Math.round(row.pf)} PF &nbsp; {Math.round(row.allPlayPct * 100)}% all-play
+          {name.nick || name.manager} &nbsp; {row.wins}-{row.losses} &nbsp; {Math.round(row.pf)} PF &nbsp; {Math.round(row.allPlayPct * 100)}% all-play
         </div>
+        {result && (
+          <div style={{ color: C.muted, fontSize: 12.5, marginTop: 3 }}>
+            <span style={{ fontWeight: 700, color: result.res === "Won" ? C.up : result.res === "Lost" ? C.down : C.muted }}>
+              {result.res === "Won" ? "W" : result.res === "Lost" ? "L" : "T"}
+            </span>
+            {" "}{result.me.toFixed(1)}{"\u2013"}{result.opp.toFixed(1)} vs {oppLabel}
+          </div>
+        )}
         {hot && (
           <div style={{ marginTop: 10 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
@@ -279,6 +335,7 @@ export default function PowerRankings() {
   const [week, setWeek] = useState(0);
   const [rows, setRows] = useState([]);
   const [hots, setHots] = useState({});
+  const [results, setResults] = useState({});
   const [deltas, setDeltas] = useState({});
   const [blurbs, setBlurbs] = useState({});
   const [blurbState, setBlurbState] = useState("idle");
@@ -306,7 +363,7 @@ export default function PowerRankings() {
         const u = userById[r.owner_id];
         const team = (u && u.metadata && u.metadata.team_name) || (u && u.display_name) || `Team ${r.roster_id}`;
         const manager = (u && u.display_name) || "Unknown manager";
-        nameMap[r.roster_id] = { team, manager };
+        nameMap[r.roster_id] = { team, manager, nick: nickFor(manager) };
       });
       if (!cache.players) {
         setLoadingMsg("Downloading the NFL player list (one-time, ~5MB)\u2026");
@@ -346,26 +403,37 @@ export default function PowerRankings() {
       cur.forEach((r) => (d[r.rosterId] = prevRank[r.rosterId] - r.rank));
     } else cur.forEach((r) => (d[r.rosterId] = "NEW"));
     setDeltas(d);
-    const h = {};
-    cur.forEach((r) => (h[r.rosterId] = scorers(weekly, r.rosterId, week, cache.players)));
-    setHots(h);
+    const h = {}, wrs = {}, tops = {};
+    cur.forEach((r) => {
+      h[r.rosterId] = scorers(weekly, r.rosterId, week, cache.players);
+      wrs[r.rosterId] = weekResult(weekly, week, r.rosterId);
+      tops[r.rosterId] = thisWeekTop(weekly, week, r.rosterId, cache.players);
+    });
+    setHots(h); setResults(wrs);
     if (blurbCache.current[week]) { setBlurbs(blurbCache.current[week]); setBlurbState("done"); return; }
     setBlurbs({}); setBlurbState("generating");
-    const nameFor = (id) => names[id] || { team: `Team ${id}`, manager: "" };
-    generateBlurbs(cur, nameFor, h, d, weekly, week)
+    const info = (id) => names[id] || { team: `Team ${id}`, manager: "", nick: "" };
+    const callName = (id) => info(id).nick || info(id).team;
+    const namesOf = (id) => [...new Set([info(id).team, info(id).manager, info(id).nick].filter(Boolean))];
+    const fallback = (r) => {
+      const wr = wrs[r.rosterId];
+      return templateBlurb(r, callName(r.rosterId), h[r.rosterId], cur.length, wr, wr ? callName(wr.oppId) : "");
+    };
+    generateBlurbs(cur, { callName, namesOf, hots: h, deltas: d, results: wrs, weekTops: tops, week })
       .then((byRank) => {
         const byRoster = {};
-        cur.forEach((r) => (byRoster[r.rosterId] = byRank[String(r.rank)] || ""));
+        cur.forEach((r) => (byRoster[r.rosterId] = byRank[String(r.rank)] || fallback(r)));
         blurbCache.current[week] = byRoster; setBlurbs(byRoster); setBlurbState("done");
       })
       .catch(() => {
         const byRoster = {};
-        cur.forEach((r) => (byRoster[r.rosterId] = templateBlurb(r, (names[r.rosterId] || {}).team || "this team", h[r.rosterId], cur.length)));
+        cur.forEach((r) => (byRoster[r.rosterId] = fallback(r)));
         blurbCache.current[week] = byRoster; setBlurbs(byRoster); setBlurbState("failed");
       });
   }, [status, week, weekly, rosterIds, names]);
 
-  const nameFor = (id) => names[id] || { team: `Team ${id}`, manager: "" };
+  const nameFor = (id) => names[id] || { team: `Team ${id}`, manager: "", nick: "" };
+  const labelFor = (id) => nameFor(id).nick || nameFor(id).team;
   const noData = status === "ready" && (!week || rows.length === 0);
   const blurbsPending = blurbState === "generating";
 
@@ -468,7 +536,8 @@ export default function PowerRankings() {
             </div>
             <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
               {rows.map((r, i) => (
-                <TeamCard key={r.rosterId} i={i} row={r} name={nameFor(r.rosterId)} hot={hots[r.rosterId]} delta={deltas[r.rosterId]} blurb={blurbs[r.rosterId]} isTop={r.rank === 1} isBottom={r.rank === rows.length} />
+                <TeamCard key={r.rosterId} i={i} row={r} name={nameFor(r.rosterId)} hot={hots[r.rosterId]} delta={deltas[r.rosterId]} blurb={blurbs[r.rosterId]} isTop={r.rank === 1} isBottom={r.rank === rows.length}
+                  result={results[r.rosterId]} oppLabel={results[r.rosterId] ? labelFor(results[r.rosterId].oppId) : ""} />
               ))}
             </div>
             <div style={{ color: C.muted, fontSize: 11, marginTop: 18, lineHeight: 1.6 }}>
