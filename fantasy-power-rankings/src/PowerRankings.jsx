@@ -101,7 +101,12 @@ function computeRankings(weekly, upto, rosterIds) {
   rows.forEach((r, i) => (r.rank = i + 1));
   return rows;
 }
-function hotHand(weekly, rosterId, upto, players) {
+// A player counts as a "key scorer" if he's within 60% of the team's top starter;
+// scoring is "balanced" if the #2 starter is within 80% of the #1.
+const KEY_SCORER_RATIO = 0.6;
+const BALANCED_RATIO = 0.8;
+
+function scorers(weekly, rosterId, upto, players) {
   const weeks = scoredWeeks(weekly).filter((w) => w <= upto).slice(-RECENT_WINDOW);
   const byPlayer = {}; let starterTotal = 0;
   weeks.forEach((w) => {
@@ -114,41 +119,85 @@ function hotHand(weekly, rosterId, upto, players) {
       starterTotal += pts;
     });
   });
-  let bestId = null, bestPts = -1;
-  for (const pid of Object.keys(byPlayer)) if (byPlayer[pid] > bestPts) { bestPts = byPlayer[pid]; bestId = pid; }
-  if (!bestId || bestPts <= 0) return null;
-  const p = players && players[bestId];
-  const known = !!(p && (p.full_name || p.last_name));
-  const name = known ? (p.full_name || `${p.first_name || ""} ${p.last_name || ""}`.trim()) : null;
+  const ranked = Object.keys(byPlayer)
+    .map((pid) => ({ pid, pts: byPlayer[pid] }))
+    .filter((x) => x.pts > 0)
+    .sort((a, b) => b.pts - a.pts);
+  if (!ranked.length) return null;
+  const describe = ({ pid, pts }) => {
+    const p = players && players[pid];
+    const name = (p && (p.full_name || [p.first_name, p.last_name].filter(Boolean).join(" "))) || null;
+    return {
+      name, pos: (p && p.position) || "", team: (p && p.team) || "",
+      pts: Math.round(pts * 10) / 10,
+      share: starterTotal ? Math.round((pts / starterTotal) * 100) : 0,
+    };
+  };
   return {
-    name, pos: (p && p.position) || "", team: (p && p.team) || "",
-    pts: Math.round(bestPts * 10) / 10,
-    share: starterTotal ? Math.round((bestPts / starterTotal) * 100) : 0,
+    top: describe(ranked[0]),
+    others: ranked.slice(1, 3).filter((x) => x.pts >= KEY_SCORER_RATIO * ranked[0].pts).map(describe),
+    balanced: ranked.length > 1 && ranked[1].pts >= BALANCED_RATIO * ranked[0].pts,
+    windowWeeks: weeks.length,
   };
 }
 
+function weekResult(weekly, week, rosterId, nameFor) {
+  const teams = weekly[week] || [];
+  const me = teams.find((t) => t.roster_id === rosterId);
+  if (!me || me.matchup_id == null) return null;
+  const opp = teams.find((t) => t.matchup_id === me.matchup_id && t.roster_id !== rosterId);
+  if (!opp) return null;
+  const a = me.points || 0, b = opp.points || 0;
+  const res = a > b ? "Won" : a < b ? "Lost" : "Tied";
+  return `${res} ${a.toFixed(1)}-${b.toFixed(1)} vs ${nameFor(opp.roster_id).team}`;
+}
+
+function moveText(d) {
+  if (d === "NEW") return "first ranking of the season";
+  if (!d) return "no change from last week";
+  const n = Math.abs(d);
+  return `${d > 0 ? "up" : "down"} ${n} spot${n > 1 ? "s" : ""} from last week`;
+}
+
 // ---- Blurbs ----------------------------------------------------------------
-function hotLabel(hot) {
-  if (!hot) return "nobody in particular";
-  return `${hot.name || "their top starter"} (${hot.pts} pts, ${hot.share}% of scoring)`;
-}
 function templateBlurb(row, team, hot, total) {
-  const hp = hotLabel(hot);
-  if (row.rank === 1) return `Top of the mountain. The all-play numbers back it up, and ${hp} is carrying the load.`;
-  if (row.rank === total) return `Somebody has to sit here, and this week it's ${team}. At least ${hp} is trying.`;
-  if (row.rank <= 3) return `Firmly in contention. ${hp} keeps this roster dangerous.`;
-  if (row.rank >= total - 2) return `Sliding toward the wheel of punishment. ${hp} can't do it alone.`;
-  return `Stuck in the muddled middle. ${hp} is the reason to keep watching.`;
+  let who = "the lineup", plural = false;
+  if (hot) {
+    const names = [hot.top, ...(hot.balanced ? hot.others : [])].map((p) => p.name).filter(Boolean);
+    if (names.length) {
+      plural = names.length > 1;
+      who = plural ? `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}` : names[0];
+    }
+  }
+  const keep = plural ? "keep" : "keeps", be = plural ? "are" : "is";
+  if (row.rank === 1) return `Top of the mountain, and the all-play numbers back it up. ${who} ${keep} this team rolling.`;
+  if (row.rank === total) return `Somebody has to sit here, and this week it's ${team}. ${who} deserved better.`;
+  if (row.rank <= 3) return `Firmly in contention. ${who} ${keep} this team dangerous.`;
+  if (row.rank >= total - 2) return `Sliding toward the wheel of punishment. Time for ${who} to turn it around.`;
+  return `Stuck in the muddled middle. ${who} ${be} the reason to keep watching.`;
 }
-async function generateBlurbs(rows, nameFor, hots) {
-  const standings = rows.map((r) => ({
-    rank: r.rank, team: nameFor(r.rosterId).team, manager: nameFor(r.rosterId).manager,
-    powerScore: r.score, record: `${r.wins}-${r.losses}`, pointsFor: Math.round(r.pf),
-    allPlayWinPct: Math.round(r.allPlayPct * 100),
-    hotPlayer: hots[r.rosterId]
-      ? `${hots[r.rosterId].name || "top starter"}${hots[r.rosterId].pos ? " " + hots[r.rosterId].pos : ""} \u2014 ${hots[r.rosterId].pts} pts, ${hots[r.rosterId].share}% of the team's starter scoring`
-      : "none standing out",
-  }));
+
+async function generateBlurbs(rows, nameFor, hots, deltas, weekly, week) {
+  const standings = rows.map((r) => {
+    const hot = hots[r.rosterId];
+    const n = hot ? hot.windowWeeks : 0;
+    return {
+      rank: r.rank,
+      team: nameFor(r.rosterId).team,
+      manager: nameFor(r.rosterId).manager,
+      powerScore: r.score,
+      movement: moveText(deltas[r.rosterId]),
+      thisWeek: weekResult(weekly, week, r.rosterId, nameFor) || "no result",
+      record: `${r.wins}-${r.losses}`,
+      pointsFor: Math.round(r.pf),
+      allPlayWinPct: Math.round(r.allPlayPct * 100),
+      scoringStyle: hot ? (hot.balanced ? "balanced" : "one standout") : "unknown",
+      keyScorers: hot
+        ? [hot.top, ...hot.others].map((p) =>
+            `${p.name || "a starter"}${p.pos ? " (" + p.pos + ")" : ""}: ${p.pts} pts over the last ${n} week${n === 1 ? "" : "s"}`)
+        : [],
+    };
+  });
   const res = await fetch("/api/blurbs", {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ standings }),
   });
@@ -188,11 +237,19 @@ function TeamCard({ row, name, hot, delta, blurb, isTop, isBottom, i }) {
           {name.manager} &nbsp; {row.wins}-{row.losses} &nbsp; {Math.round(row.pf)} PF &nbsp; {Math.round(row.allPlayPct * 100)}% all-play
         </div>
         {hot && (
-          <div style={{ marginTop: 10, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-            <span style={{ fontSize: 14 }}>{"\uD83D\uDD25"}</span>
-            <span style={{ color: C.chalk, fontSize: 14, fontWeight: 600 }}>{hot.name || "Hot hand"}</span>
-            {hot.pos && <span style={{ color: C.muted, fontSize: 12 }}>{hot.pos}{hot.team ? " \u00B7 " + hot.team : ""}</span>}
-            <span style={{ color: C.flame, fontSize: 13, fontWeight: 600 }}>{hot.pts} pts / {hot.share}% of scoring</span>
+          <div style={{ marginTop: 10 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+              <span style={{ fontSize: 14 }}>{"\uD83D\uDD25"}</span>
+              <span style={{ color: C.chalk, fontSize: 14, fontWeight: 600 }}>{hot.top.name || "Hot hand"}</span>
+              {hot.top.pos && <span style={{ color: C.muted, fontSize: 12 }}>{hot.top.pos}{hot.top.team ? " \u00B7 " + hot.top.team : ""}</span>}
+              <span style={{ color: C.flame, fontSize: 13, fontWeight: 600 }}>{hot.top.pts} pts / {hot.top.share}% of scoring</span>
+              <span style={{ color: C.muted, fontSize: 12 }}>last {hot.windowWeeks} wk{hot.windowWeeks === 1 ? "" : "s"}</span>
+            </div>
+            {hot.others.length > 0 && (
+              <div style={{ color: C.muted, fontSize: 12.5, marginTop: 4 }}>
+                Also producing: {hot.others.map((o) => `${o.name || "Starter"} ${o.pts}`).join(" \u00B7 ")}
+              </div>
+            )}
           </div>
         )}
         <div style={{ marginTop: 10, color: isBottom ? "#f0b9b0" : C.chalk, opacity: 0.92, fontSize: 14.5, lineHeight: 1.5, maxWidth: "62ch", fontFamily: bodyFont }}>
@@ -290,12 +347,12 @@ export default function PowerRankings() {
     } else cur.forEach((r) => (d[r.rosterId] = "NEW"));
     setDeltas(d);
     const h = {};
-    cur.forEach((r) => (h[r.rosterId] = hotHand(weekly, r.rosterId, week, cache.players)));
+    cur.forEach((r) => (h[r.rosterId] = scorers(weekly, r.rosterId, week, cache.players)));
     setHots(h);
     if (blurbCache.current[week]) { setBlurbs(blurbCache.current[week]); setBlurbState("done"); return; }
     setBlurbs({}); setBlurbState("generating");
     const nameFor = (id) => names[id] || { team: `Team ${id}`, manager: "" };
-    generateBlurbs(cur, nameFor, h)
+    generateBlurbs(cur, nameFor, h, d, weekly, week)
       .then((byRank) => {
         const byRoster = {};
         cur.forEach((r) => (byRoster[r.rosterId] = byRank[String(r.rank)] || ""));
@@ -415,7 +472,7 @@ export default function PowerRankings() {
               ))}
             </div>
             <div style={{ color: C.muted, fontSize: 11, marginTop: 18, lineHeight: 1.6 }}>
-              Power Score blends all-play win% (40%), total points (25%), last-{RECENT_WINDOW}-week scoring (25%), and actual record (10%), each scaled 0\u2013100 across the league.
+              Power Score blends all-play win% (40%), total points (25%), last-{RECENT_WINDOW}-week scoring (25%), and actual record (10%), each scaled 0-100 across the league.
             </div>
           </div>
         )}

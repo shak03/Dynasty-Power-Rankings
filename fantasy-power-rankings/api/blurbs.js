@@ -6,20 +6,33 @@ export default async function handler(req, res) {
   const model = process.env.BLURB_MODEL || "claude-haiku-4-5";
   const standings = (req.body && req.body.standings) || [];
 
-  const prompt =
-    "You are writing weekly fantasy football power-ranking blurbs for a 10-team dynasty league that lives for trash talk. " +
-    "Voice: escalate ENERGY down the list. Top teams get genuine hype (ESPN-analyst 'buy stock now' energy). " +
-    "Middle teams get wry, teasing takes. Bottom teams get playful roasts and dunks \u2014 funny, never cruel, PG-13, no profanity, no slurs. " +
-    "Each blurb MUST name that team's hot player and lean on the real numbers provided. Keep each to 2 punchy sentences.\n\n" +
-    "Ranking JSON:\n" + JSON.stringify(standings) +
-    '\n\nRespond with ONLY a JSON object mapping each rank (as a string) to its blurb string. ' +
-    'No markdown, no code fences, no commentary. Example: {"1":"...","2":"..."}';
+  const prompt = [
+    "You are writing weekly fantasy football power-ranking blurbs for a 10-team dynasty league that lives for trash talk.",
+    "",
+    "VOICE: energy escalates down the list. Top teams get genuine hype (ESPN-analyst 'buy stock now' energy). Middle teams get wry, teasing takes. Bottom teams get playful roasts: funny, never cruel, PG-13, no profanity, no slurs.",
+    "",
+    "WHAT EACH BLURB IS ABOUT: the TEAM, not one player. Build it from the team's story: this week's result (thisWeek), record, all-play %, and movement.",
+    "",
+    "CREDITING PLAYERS (keyScorers, cumulative over the window stated):",
+    "- If scoringStyle is 'balanced', credit two or more of the keyScorers. A balanced attack is the story.",
+    "- If scoringStyle is 'one standout', name that player once, but keep the team as the subject.",
+    "- Mention each player at most once. Player totals are over multiple weeks, not one game, so describe them that way (e.g. 'over the last three weeks') or just call them hot.",
+    "",
+    "NEVER: mention the bench, depth, roster spots, 'supporting cast', or what percentage of the team's scoring a player accounts for; imply the other players are bad or that one player is 'carrying' everyone; invent or compute numbers. Quote numbers exactly as given.",
+    "",
+    "LENGTH: 2 punchy sentences per blurb.",
+    "",
+    "Ranking JSON:",
+    JSON.stringify(standings),
+    "",
+    'Respond with ONLY a JSON object mapping each rank (as a string) to its blurb string. No markdown, no code fences, no commentary. Example: {"1":"...","2":"..."}',
+  ].join("\n");
 
   try {
     const r = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: { "content-type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01" },
-      body: JSON.stringify({ model, max_tokens: 1200, messages: [{ role: "user", content: prompt }] }),
+      body: JSON.stringify({ model, max_tokens: 1500, messages: [{ role: "user", content: prompt }] }),
     });
     const data = await r.json();
     if (!r.ok) { res.status(r.status).json({ error: data }); return; }
